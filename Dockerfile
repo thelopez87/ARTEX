@@ -157,16 +157,88 @@ RUN set -eux; \
     echo "baked nuclei templates: $count"; \
     test "$count" -gt 10000
 
+# ---------------------------------------------------- mobile-security tools ---
+# Android/APK testing toolbox for the mobile skills: jadx (dex/java decompiler),
+# apktool (manifest/resource decode + rebuild), Android build-tools (aapt, aapt2,
+# zipalign, apksigner) and frida-server device agents. Everything is pinned and
+# verified against the official sha256 digest of the exact release asset (GitHub
+# release digests for jadx/apktool/frida; the Google repository zip for
+# build-tools), the same idea as the tools stage above.
+#
+# jadx and apktool are pure Java, so they are architecture-independent. Google
+# ships build-tools linux binaries for x86_64 only: on an arm64 build the native
+# tools are pruned here and only the Java apksigner jar survives. frida-server
+# binaries target the ANDROID device ABIs, so all of them are staged regardless
+# of the image architecture; the runtime frida CLI is pinned to the same version
+# in the venv block below, keeping client and device agent version-exact.
+FROM --platform=$BUILDPLATFORM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc AS mobile-tools
+ARG TARGETARCH
+ARG JADX_VERSION=1.5.7
+ARG JADX_SHA256=1755e4242ade71a077438723689f404079592ec7764a3a0572f98fef94ebcbf3
+ARG APKTOOL_VERSION=3.0.3
+ARG APKTOOL_SHA256=dbf930b076c6b9be08d57c449cacefc3bdd6b71ebd59b3066fc0e1f5b14f9423
+ARG BUILD_TOOLS_SHA256=e858c4b60069d0431051b225d384413b1643e1289b00a4825aed347f25bd510f
+ARG FRIDA_VERSION=17.27.6
+ARG FRIDA_SERVER_ARM_SHA256=7ee46853e538a645f4a107a6af35ba73acd9b7ffa28c64d1a3e2eaaaa89e41a9
+ARG FRIDA_SERVER_ARM64_SHA256=1a803a00d1e2e7c0426f13f9097d8e4275c96ffa2030fea374e860c97d226b75
+ARG FRIDA_SERVER_X86_64_SHA256=5d3030f90fc110fc91249c392e1f1402522f89753a6404e83884fdaa31a04bf0
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl unzip xz-utils openjdk-17-jre-headless \
+    && rm -rf /var/lib/apt/lists/*
+RUN set -eux; \
+    mkdir -p /out-mobile/jadx /out-mobile/apktool /out-mobile/build-tools /out-mobile/frida; \
+    curl -fsSL "https://github.com/skylot/jadx/releases/download/v${JADX_VERSION}/jadx-${JADX_VERSION}.zip" -o /tmp/jadx.zip; \
+    got="$(sha256sum /tmp/jadx.zip | cut -d' ' -f1)"; \
+    [ "$got" = "$JADX_SHA256" ] || { echo "jadx checksum mismatch: want $JADX_SHA256 got $got" >&2; exit 1; }; \
+    unzip -q /tmp/jadx.zip -d /out-mobile/jadx; \
+    /out-mobile/jadx/bin/jadx --version; \
+    curl -fsSL "https://github.com/iBotPeaches/Apktool/releases/download/v${APKTOOL_VERSION}/apktool_${APKTOOL_VERSION}.jar" -o /out-mobile/apktool/apktool.jar; \
+    got="$(sha256sum /out-mobile/apktool/apktool.jar | cut -d' ' -f1)"; \
+    [ "$got" = "$APKTOOL_SHA256" ] || { echo "apktool checksum mismatch: want $APKTOOL_SHA256 got $got" >&2; exit 1; }; \
+    java -jar /out-mobile/apktool/apktool.jar --version; \
+    rm -f /tmp/jadx.zip
+RUN set -eux; \
+    curl -fsSL "https://dl.google.com/android/repository/build-tools_r34-linux.zip" -o /tmp/bt.zip; \
+    got="$(sha256sum /tmp/bt.zip | cut -d' ' -f1)"; \
+    [ "$got" = "$BUILD_TOOLS_SHA256" ] || { echo "build-tools checksum mismatch: want $BUILD_TOOLS_SHA256 got $got" >&2; exit 1; }; \
+    unzip -q /tmp/bt.zip -d /tmp/bt; \
+    mv /tmp/bt/android-14 /out-mobile/build-tools/tools; \
+    rm -f /tmp/bt.zip; \
+    if [ "${TARGETARCH:-amd64}" != "amd64" ]; then \
+      echo "build-tools linux binaries are x86_64-only; keeping the Java apksigner for arm64"; \
+      find /out-mobile/build-tools/tools -maxdepth 1 -type f ! -name apksigner -delete; \
+    fi; \
+    /out-mobile/build-tools/tools/apksigner --version
+RUN set -eux; \
+    for abi in arm arm64 x86_64; do \
+      case "$abi" in \
+        arm) want="$FRIDA_SERVER_ARM_SHA256" ;; \
+        arm64) want="$FRIDA_SERVER_ARM64_SHA256" ;; \
+        x86_64) want="$FRIDA_SERVER_X86_64_SHA256" ;; \
+      esac; \
+      curl -fsSL "https://github.com/frida/frida/releases/download/${FRIDA_VERSION}/frida-server-${FRIDA_VERSION}-android-${abi}.xz" -o /tmp/fs.xz; \
+      got="$(sha256sum /tmp/fs.xz | cut -d' ' -f1)"; \
+      [ "$got" = "$want" ] || { echo "frida-server ${abi} checksum mismatch: want $want got $got" >&2; exit 1; }; \
+      xz -dc /tmp/fs.xz > "/out-mobile/frida/frida-server-${FRIDA_VERSION}-android-${abi}"; \
+      chmod 0755 "/out-mobile/frida/frida-server-${FRIDA_VERSION}-android-${abi}"; \
+      rm -f /tmp/fs.xz; \
+    done; \
+    ls -la /out-mobile/frida
+
 # ---------------------------------------------------------------- runtime ---
 FROM python:3.12-slim-bookworm@sha256:935c3c5b12357a7e10caa9c1e6ca5692344d97cf229832ef584be2cec9fc03df
 ARG TARGETARCH
 # Common tools: ripgrep / curl / vim, plus a set of recon staples (add/remove as needed).
+# adb + a JRE serve the mobile skills (device control, apktool/jadx/apksigner);
+# adb here is the container-side client only — devices connect over the network
+# (the container has no USB passthrough), see docs/mobile-security-testing.md.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates ripgrep curl wget vim git jq unzip xz-utils \
       dnsutils iputils-ping netcat-openbsd inetutils-telnet whois nmap \
       arp-scan arping fping iproute2 netdiscover net-tools nfs-common \
       python3-impacket python3-paramiko python3-scapy rpcbind sqlite3 xxd \
       hashcat hydra john ncrack openssh-client ssh-audit sshpass \
+      adb openjdk-17-jre-headless \
     && rm -rf /var/lib/apt/lists/*
 # Node 22 from the official nodejs.org tarball: bookworm's apt nodejs is 18,
 # Playwright requires >=20, and 20 is end-of-life. 22 matches the CI and release
@@ -195,6 +267,11 @@ RUN set -eux; \
 COPY --from=tools /out/ /usr/local/bin/
 COPY --from=tools /opt/sqlmap /opt/sqlmap
 COPY --from=tools /opt/nuclei-templates /opt/nuclei-templates
+# Mobile toolchain from the mobile-tools stage (see that stage for what lands where).
+COPY --from=mobile-tools /out-mobile/jadx /opt/jadx
+COPY --from=mobile-tools /out-mobile/apktool /opt/apktool
+COPY --from=mobile-tools /out-mobile/build-tools /opt/android-build-tools
+COPY --from=mobile-tools /out-mobile/frida /opt/frida-server-android
 # Read by nuclei in preference to $HOME/nuclei-templates, so root and the executor
 # resolve the same set. The directory stays root-owned and world-readable; scans
 # never need to write to it. The second variable keeps the set frozen: without it a
@@ -202,14 +279,26 @@ COPY --from=tools /opt/nuclei-templates /opt/nuclei-templates
 # repository, which rewrites the baked tree (and, on a slow link, adds tens of MB to
 # the writable layer for a result the bake already provides).
 ENV NUCLEI_TEMPLATES_DIR=/opt/nuclei-templates \
-    DISABLE_NUCLEI_TEMPLATES_PUBLIC_DOWNLOAD=true
+    DISABLE_NUCLEI_TEMPLATES_PUBLIC_DOWNLOAD=true \
+    FRIDA_SERVER_DIR=/opt/frida-server-android
 # -duc is what keeps this a check rather than an update: `nuclei -tl` runs the
 # automatic nuclei/templates update check first, so it could replace the pinned set
 # with the latest release inside the layer we are about to inspect.
 RUN set -eux; \
     ln -s /opt/sqlmap/sqlmap.py /usr/local/bin/sqlmap; \
+    ln -s /opt/jadx/bin/jadx /usr/local/bin/jadx; \
+    printf '#!/bin/sh\nexec java -jar /opt/apktool/apktool.jar "$@"\n' > /usr/local/bin/apktool; \
+    chmod 0755 /usr/local/bin/apktool; \
+    ln -s /opt/android-build-tools/tools/apksigner /usr/local/bin/apksigner; \
+    if [ "${TARGETARCH:-amd64}" = "amd64" ]; then \
+      ln -s /opt/android-build-tools/tools/zipalign /usr/local/bin/zipalign; \
+      ln -s /opt/android-build-tools/tools/aapt /usr/local/bin/aapt; \
+      ln -s /opt/android-build-tools/tools/aapt2 /usr/local/bin/aapt2; \
+    fi; \
     nuclei -version >/dev/null; httpx -version; subfinder -version; katana -version; \
     ffuf -V >/dev/null; dalfox --version >/dev/null; sqlmap --version >/dev/null; \
+    jadx --version >/dev/null; apktool --version >/dev/null; apksigner --version >/dev/null; \
+    adb version >/dev/null; \
     templates="$(nuclei -tl -silent -duc | wc -l)"; \
     echo "nuclei templates visible at build time: $templates"; \
     test "$templates" -gt 10000
@@ -240,6 +329,35 @@ RUN set -eux; \
     bbot --dry-run -t example.com -m wafw00f,paramminer_getparams,lightfuzz,sslcert,gowitness,retirejs >/dev/null 2>&1 || true; \
     bbot --dry-run -t example.com -m wafw00f,paramminer_getparams,lightfuzz,sslcert,gowitness,retirejs --no-color >/tmp/bbot-dry.log 2>&1 || true; \
     ! grep -qE "Installing|ERRR|CRITICAL" /tmp/bbot-dry.log || { cat /tmp/bbot-dry.log; exit 1; }
+
+
+# Mobile security venv: frida CLI, objection, androguard, apkid, apkleaks and
+# mobsfscan, all pinned. Own venv to isolate from the image python, same as bbot.
+# frida (python bindings) is pinned to the same version as the frida-server
+# device agents staged above, so adb-pushed instrumentation is version-exact.
+# mobsfscan pulls the MobSF semgrep rule set (semgrep is the largest single
+# dependency in this block); drop it there if image size matters.
+ARG FRIDA_TOOLS_VERSION=14.13.2
+ARG FRIDA_PY_VERSION=17.27.6
+ARG OBJECTION_VERSION=1.12.5
+ARG ANDROGUARD_VERSION=4.1.4
+ARG APKID_VERSION=3.2.0
+ARG APKLEAKS_VERSION=2.6.3
+ARG MOBSFSCAN_VERSION=1.2.0
+RUN set -eux; \
+    python -m venv /opt/mobilesec; \
+    /opt/mobilesec/bin/pip install --no-cache-dir \
+      "frida==${FRIDA_PY_VERSION}" \
+      "frida-tools==${FRIDA_TOOLS_VERSION}" \
+      "objection==${OBJECTION_VERSION}" \
+      "androguard==${ANDROGUARD_VERSION}" \
+      "apkid==${APKID_VERSION}" \
+      "apkleaks==${APKLEAKS_VERSION}" \
+      "mobsfscan==${MOBSFSCAN_VERSION}"; \
+    for c in frida frida-ps frida-ls-devices frida-trace frida-kill objection apkid apkleaks mobsfscan androguard; do \
+      ln -s "/opt/mobilesec/bin/$c" "/usr/local/bin/$c"; \
+    done; \
+    frida --version; objection version
 
 
 # Preinstall Playwright MCP and CLI (globally) so no network download is needed at runtime.
@@ -282,6 +400,11 @@ RUN chmod +x /app/artex /app/start.sh && mkdir -p -m 0700 /app/keys \
 # when the container runs without docker-compose.yml's no-new-privileges.
 RUN find / -xdev -perm /6000 -type f -exec chmod a-s {} +
 COPY skills/ /app/skills/
+# Operator-facing helper the frida skill runs through Bash (pushes the baked
+# frida-server to the connected device); kept out of the agent workspace on
+# purpose — it lives at a fixed absolute path.
+COPY scripts/mobile/ /app/scripts/mobile/
+RUN chmod 0755 /app/scripts/mobile/*.sh
 # persistence points: data/ (traffic index, task files, transcripts) and keys/ (jwt.key, secret.key, via ARTEX_JWT_KEY_DIR)
 VOLUME ["/app/data", "/app/keys"]
 EXPOSE 8787 8788
