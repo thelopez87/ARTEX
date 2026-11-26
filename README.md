@@ -292,6 +292,34 @@ worker remains confined to the intent it claimed.
   </details>
 - **Task categories, templates, relations and archives** for repeatable engagements.
 
+### Mobile security testing (APK)
+
+The image ships an Android testing toolchain (`adb`, `jadx`, `apktool`, `aapt`/`aapt2`,
+`apksigner`/`zipalign`, `frida`, `objection`, `androguard`, `apkid`, `apkleaks`, `mobsfscan`) and
+three skills that drive it, so APK tasks run through the same planner/worker loop, scope rules,
+approval gates and evidence store as web tasks.
+
+- **Static APK analysis** (`apk-static-analysis`): manifest review (exported components,
+  `debuggable`, `allowBackup`, cleartext and network security config), jadx decompilation,
+  packing detection (`apkid`), secret and endpoint extraction (`apkleaks`, ripgrep), and
+  MASVS-mapped SAST (`mobsfscan`) — every finding quoted from the decompiled source.
+- **Dynamic instrumentation** (`frida-dynamic-instrumentation`): push the version-matched baked
+  `frida-server` to a rooted device/emulator over network adb
+  (`scripts/mobile/setup-frida-server.sh`), explore the app with objection (activities,
+  keystores, hooking, `android sslpinning disable`, `android root disable`), repackage with the
+  frida gadget (`objection patchapk`) when no root exists, and route device traffic into the
+  recording proxy via `adb reverse tcp:8788 tcp:8788` so exchanges land in the same traffic
+  store as every other tool call.
+- **Mobile API testing** (`mobile-api-testing`): endpoints recovered from the APK or from
+  live captures are registered in the asset graph and tested with the standard web toolchain
+  (authorization and IDOR comparisons, hidden parameters, token handling), with findings bound
+  to the recorded request/response pair.
+
+The frida CLI, `frida-server` device agents and all mobile tools are pinned per release asset in
+the Dockerfile, verified by checksum. See [Mobile security testing](docs/mobile-security-testing.md)
+for device connection, CA installation and example task goals. Only authorized lab targets are
+in scope for dynamic instrumentation and repackaging; the skills state the boundaries.
+
 ### Platform
 
 - **LLM profiles with failover**: Anthropic, OpenAI, OpenAI-compatible relays and keyless Ollama;
@@ -392,9 +420,10 @@ its own variable. The server percent-encodes it into the connection URL, so a pa
 literal `$`. The `ARTEX_PG_*` variables take the password raw; quote it in a shell.
 
 The image includes a scanner toolchain (`nmap`, `nuclei`, `httpx`, `katana`, `ffuf`, `dalfox`,
-`sqlmap`, `ripgrep`, `curl`, `npm`, …) and built-in `/app/skills`. The GHCR Compose file below
-persists `./keys` and `./data`; it does not mount a host `skills/` directory, so the image's
-built-in skills are used.
+`sqlmap`, `ripgrep`, `curl`, `npm`, …), an Android/APK testing toolchain (`adb`, `jadx`,
+`apktool`, `apksigner`, `frida`, `objection`, `mobsfscan`, …) and built-in `/app/skills`. The
+GHCR Compose file below persists `./keys` and `./data`; it does not mount a host `skills/`
+directory, so the image's built-in skills are used.
 
 #### Compose stack from the prebuilt image
 
